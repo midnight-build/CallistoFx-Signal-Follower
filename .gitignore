@@ -1,0 +1,5 @@
+.env
+trade_session.session
+__pycache__/
+*.pyc
+.vscode/
