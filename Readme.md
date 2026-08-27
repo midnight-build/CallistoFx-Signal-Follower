@@ -128,14 +128,25 @@ restart with new config regardless of where you set them — there's no
 
 ## Requirements
 
-- A VPS running **Ubuntu 22.04 or 24.04 LTS**, at least 2GB RAM
+- A VPS running **Ubuntu 22.04 or 24.04 LTS**. This guide walks through
+  getting one for free on Oracle Cloud's Always Free tier — see Step 1
+  below — but any Ubuntu VPS works the same way from Step 3 onward.
 - An MT5 broker account — **use a demo account until you trust the setup**
 - A Telegram account that's already a member of the signal channel(s)
-- About 45–60 minutes for the initial setup (mostly waiting for
+- A debit or credit card, only for identity verification when creating
+  the Oracle Cloud account (see Step 1 — this bot itself runs entirely on
+  free-tier resources, no charge)
+- About 60–90 minutes for the initial setup (mostly waiting for
   downloads/installs)
 
 You don't need to know how to code to follow this guide — just how to
 copy/paste commands into a terminal.
+
+**A note on RAM:** the free Oracle Cloud shape this guide uses has only
+1GB of RAM, which is tight for running Wine + MT5 + the bridge + the bot
+all at once. Step 2 adds a swap file to compensate — don't skip it. If
+you're using your own VPS instead and it already has 2GB+ RAM, you can
+skip Step 2.
 
 ---
 
@@ -144,13 +155,103 @@ copy/paste commands into a terminal.
 This installs everything on a fresh Ubuntu VPS. Run every command below
 over SSH, one at a time, waiting for each to finish.
 
-### 1. Update the system
+### 1. Create a free Oracle Cloud VPS
+
+Skip this step if you already have a VPS — go straight to Step 3.
+
+Oracle Cloud's "Always Free" tier includes a small VM that costs nothing,
+indefinitely, and is enough to run this bot. Here's how to get one:
+
+1. Go to [oracle.com/cloud/free](https://www.oracle.com/cloud/free/) and
+   click **Start for free**. Sign up with an email address.
+2. You'll be asked for a debit or credit card. **This is for identity
+   verification only** — Oracle explicitly does not charge it unless you
+   later choose to upgrade to a paid account yourself. The bot itself
+   only ever uses Always Free resources.
+3. Pick your **Home Region** carefully during signup — this can't be
+   changed later, and it's where your free resources will live. Any
+   region is fine; pick whichever is geographically closest to you or
+   your broker's servers.
+4. Once your account is ready and you're at the OCI Console, click the
+   **☰ hamburger menu** (top left), then **Compute → Instances**.
+5. Click **Create instance**.
+6. Give it a name (anything, e.g. `callistofx-vps`).
+7. Under **Placement**, choose **AD 3** as the availability domain. (If
+   creation later fails with an "out of capacity" or "shape not
+   available" error for this AD, come back here and try AD 1 or AD 2
+   instead — Oracle restricts the free shape to whichever one AD in your
+   region actually has capacity for it, and it isn't always AD 3.)
+8. Under **Image and shape**, click **Edit**, then **Change image** and
+   select **Canonical Ubuntu 22.04** (or 24.04 if that's what you'd
+   rather run — either works with this guide).
+9. Still under **Image and shape**, click **Change shape**. Select the
+   **Specialty and previous generation** category, then choose
+   **VM.Standard.E2.1.Micro (Always Free-eligible)**. Confirm the shape.
+10. Under **Networking (VNIC)**, the defaults are almost always fine: it
+    creates a new Virtual Cloud Network and subnet for you automatically,
+    and **"Assign a public IPv4 address"** should already be checked —
+    make sure it stays checked, since you'll need that IP to SSH in.
+11. Under **Add SSH keys**, select **Generate a key pair for me**, then
+    click **Save private key** and **Save public key** — save both files
+    somewhere safe on your own computer. You'll use the private key to
+    connect. (If you already have your own SSH key pair, you can upload
+    your public key here instead.)
+12. Leave the boot volume settings as default (47GB is enough) and click
+    **Create**.
+13. Wait for the instance to go from "Provisioning" to a green
+    "Running" state (usually under a minute). Once it's running, copy
+    its **Public IP address** from the instance details page.
+14. Connect to it from your own computer:
+
+```bash
+chmod 600 /path/to/your-downloaded-private-key.pem
+ssh -i /path/to/your-downloaded-private-key.pem ubuntu@YOUR_PUBLIC_IP
+```
+
+If the connection times out rather than being refused, the most common
+cause is the VCN's security list not allowing port 22 — the default
+"quick create" networking setup normally does allow it, but if you
+customized anything in step 10, double check under **Networking → Virtual
+Cloud Networks → (your VCN) → Security Lists → Default Security List**
+that there's an ingress rule allowing TCP port 22 from `0.0.0.0/0`.
+
+You're now at the same starting point as any other fresh Ubuntu VPS —
+continue with Step 2.
+
+### 2. Add swap space
+
+Skip this step if your VPS already has 2GB+ RAM.
+
+The free-tier shape from Step 1 has only 1GB of RAM. Wine, MT5, and the
+bridge server together can exceed that under load, causing the process to
+be killed unpredictably. A swap file gives Linux breathing room to fall
+back on when physical RAM runs out — slower than RAM, but far better than
+a crash:
+
+```bash
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+Verify it's active:
+
+```bash
+free -h
+```
+
+You should see a non-zero number in the Swap row. This survives reboots
+since it's now in `/etc/fstab`.
+
+### 3. Update the system
 
 ```bash
 sudo apt update && sudo apt upgrade -y
 ```
 
-### 2. Install Wine
+### 4. Install Wine
 
 MetaTrader 5 only exists for Windows. Wine is a compatibility layer that
 lets it run on Linux — this is the single most important piece of the
@@ -172,7 +273,7 @@ Check it installed:
 wine --version
 ```
 
-### 3. Install a virtual display
+### 5. Install a virtual display
 
 Your VPS has no monitor, but MT5 is a graphical Windows program and needs
 somewhere to "draw" — even if nobody's looking at it. `Xvfb` provides a
@@ -202,7 +303,7 @@ ssh -L 5900:localhost:5900 your_user@your_vps_ip
 You only need this VNC connection for the one-off installation/login
 steps below — the bot itself runs headless afterwards.
 
-### 4. Install MT5 under Wine
+### 6. Install MT5 under Wine
 
 Download the installer from your broker's website (they all provide a
 Windows `.exe`, usually called `mt5setup.exe`), then:
@@ -221,7 +322,7 @@ While you're in there:
   trading"**.
 - Click the **AutoTrading** button in the toolbar so it shows green/on.
 
-### 5. Install Python for Windows, inside Wine
+### 7. Install Python for Windows, inside Wine
 
 The bridge that connects your Linux bot to MT5 needs a Windows Python
 installation living inside Wine (separate from the normal Linux Python
@@ -242,7 +343,7 @@ Find where it installed to (you'll need this path shortly):
 find ~/.wine -iname "python.exe"
 ```
 
-### 6. Install the MT5 bridge
+### 8. Install the MT5 bridge
 
 Inside the Wine Python you just installed, add the official MetaTrader5
 package and `rpyc` (the two packages the bridge server needs to talk to
@@ -252,17 +353,18 @@ MT5):
 wine "PATH_TO_WINE_PYTHON/python.exe" -m pip install MetaTrader5 "rpyc==6.0.0"
 ```
 
-(Replace `PATH_TO_WINE_PYTHON` with the path `find` gave you in step 5.)
+(Replace `PATH_TO_WINE_PYTHON` with the path `find` gave you in step 7.)
 
-### 7. Install the bot's own Python dependencies (Linux side)
+### 9. Get the bot onto your VPS and install its dependencies
 
 ```bash
-sudo apt install python3-pip -y
+sudo apt install git python3-pip -y
+git clone https://github.com/midnight-build/CallistoFx-Signal-Follower.git ~/callstoFx
 cd ~/callstoFx
 pip3 install -r requirements.txt
 ```
 
-### 8. Get your Telegram API credentials
+### 10. Get your Telegram API credentials
 
 1. Go to https://my.telegram.org and log in with the Telegram account
    that's a member of the signal channel(s).
@@ -276,7 +378,7 @@ cp .env.example .env
 nano .env
 ```
 
-### 9. Set up config.py
+### 11. Set up config.py
 
 Open `config.py` and fill in your channel IDs, symbol name, and lot
 sizing — every setting has a comment explaining what it does and how to
@@ -284,9 +386,9 @@ find the right value. The defaults match the CallistoFx channels; change
 `MAIN_CHANNEL_ID`, `TEST_CHANNEL_ID`, etc. if you're using different
 signal sources.
 
-### 10. First run (by hand)
+### 12. First run (by hand)
 
-With MT5 still open under Wine (from step 4), start the bridge server:
+With MT5 still open under Wine (from step 6), start the bridge server:
 
 ```bash
 wine "PATH_TO_WINE_PYTHON/python.exe" -m mt5linux --host localhost --port 8001 "PATH_TO_WINE_PYTHON/python.exe"
@@ -300,7 +402,7 @@ python3 main.py
 ```
 
 The first time it runs, Telethon will ask for the phone number of the
-Telegram account from step 8, then a login code sent to that account via
+Telegram account from step 10, then a login code sent to that account via
 Telegram. After that one-time login, it saves a `trade_session` file and
 won't ask again.
 
@@ -308,7 +410,7 @@ If you see `MT5 Connected` and `Bot started - waiting for Telegram
 messages...`, everything is working. Send a test signal or wait for a
 real one.
 
-### 11. Make it permanent
+### 13. Make it permanent
 
 Right now, the bot and the bridge only run while your SSH session is
 open. `callistofx.service` (included in this repo) turns the bot itself
@@ -403,11 +505,11 @@ an issue/PR to add the new phrasing to `close_all_pattern` in `main.py`.
 ## Troubleshooting
 
 **"MT5 initialization failed"** — MT5 isn't running under Wine, or the
-bridge server (step 10) isn't running, or the port doesn't match. Check
+bridge server (step 12) isn't running, or the port doesn't match. Check
 `config.py` and the bridge command both say the same port.
 
 **"AutoTrading is DISABLED in MT5!"** — click the AutoTrading button in
-the MT5 toolbar (see step 4) — it needs to be green.
+the MT5 toolbar (see step 6) — it needs to be green.
 
 **Trades never open even though signals arrive** — check
 `MAX_ACTIVE_TRADES` in `config.py` hasn't been reached, that the bot
@@ -416,7 +518,7 @@ matches `SYMBOL` exactly (many brokers suffix gold with `.s`, `.raw`,
 etc. — check Market Watch in MT5).
 
 **Bridge connection refused** — make sure you started the bridge server
-(step 10/11) *before* the bot, and that MT5 itself is open under Wine.
+(step 12/13) *before* the bot, and that MT5 itself is open under Wine.
 
 **Wine/MT5 randomly stops responding** — Wine running MT5 for weeks at a
 time can get flaky. A scheduled weekly restart of the whole stack (Xvfb →
@@ -447,3 +549,8 @@ Both `active_trades.json`, `runtime_settings.json`, and `callistofx.lock`
 are runtime state, not settings — make sure your `.gitignore` includes
 them alongside `.env` and `trade_session.session`.
 
+---
+
+## License
+
+MIT — see `LICENSE`.
