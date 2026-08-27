@@ -12,9 +12,14 @@ MT5 terminal reachable via mt5linux on 127.0.0.1:8001, and the symbol
 configured below (XAUUSD.s) enabled with AutoTrading on.
 """
 
+import os
 import re
+import json
+import time
 import asyncio
 import logging
+import atexit
+import fcntl
 
 from telethon import TelegramClient, events
 from mt5linux import MetaTrader5
@@ -31,6 +36,54 @@ logging.basicConfig(
     datefmt='%H:%M:%S',
 )
 logger = logging.getLogger('signal_bot')
+
+# ==================================================
+# SINGLE-INSTANCE LOCK
+# ==================================================
+# Prevents two copies of this bot running at once (e.g. forgetting one's
+# already running elsewhere), which would double-trade every signal. Held
+# for as long as this process is alive; released automatically on exit,
+# clean or not, since it's tied to the file descriptor.
+
+_lock_file_handle = None
+
+
+def acquire_lock():
+    global _lock_file_handle
+
+    _lock_file_handle = open(config.LOCK_FILE, 'w')
+
+    try:
+        fcntl.flock(_lock_file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.critical(
+            'Another instance of this bot appears to already be running '
+            '(lock file %s is held) - exiting to avoid double-trading '
+            'every signal.', config.LOCK_FILE)
+        raise SystemExit(1)
+
+    _lock_file_handle.write(str(os.getpid()))
+    _lock_file_handle.flush()
+    logger.info('Acquired single-instance lock (%s)', config.LOCK_FILE)
+
+
+def release_lock():
+    global _lock_file_handle
+
+    if _lock_file_handle is None:
+        return
+
+    try:
+        fcntl.flock(_lock_file_handle, fcntl.LOCK_UN)
+        _lock_file_handle.close()
+    except Exception:
+        pass
+
+    _lock_file_handle = None
+
+
+atexit.register(release_lock)
+acquire_lock()
 
 # ==================================================
 # TELEGRAM / MT5 SETUP
@@ -59,6 +112,43 @@ if terminal_info:
         logger.warning('AutoTrading is DISABLED in MT5!')
         logger.warning('Enable it in MT5 GUI and restart the service')
 
+
+def ensure_mt5_connected():
+    """
+    Verifies the MT5 bridge connection is alive and tries to restore it if
+    not (Wine/MT5 crashing or the bridge server dropping are the usual
+    causes). After config.MT5_RECONNECT_ATTEMPTS failed tries, gives up
+    and exits the whole process - systemd (see callistofx.service) then
+    restarts it from a clean state rather than the bot limping along
+    unable to manage trades.
+    """
+
+    try:
+        if mt5.terminal_info() is not None:
+            return
+    except Exception:
+        pass
+
+    logger.warning('MT5 connection appears to be down - attempting to reconnect')
+
+    for attempt in range(1, config.MT5_RECONNECT_ATTEMPTS + 1):
+        try:
+            if mt5.initialize() and mt5.terminal_info() is not None:
+                logger.info('MT5 reconnected (attempt %d)', attempt)
+                return
+        except Exception:
+            logger.exception('MT5 reconnect attempt %d raised an exception', attempt)
+
+        logger.warning(
+            'MT5 reconnect attempt %d/%d failed - retrying in %ds',
+            attempt, config.MT5_RECONNECT_ATTEMPTS, config.MT5_RECONNECT_DELAY_SECONDS)
+        time.sleep(config.MT5_RECONNECT_DELAY_SECONDS)
+
+    logger.critical(
+        'Could not reconnect to MT5 after %d attempts - exiting so '
+        'systemd can restart the process', config.MT5_RECONNECT_ATTEMPTS)
+    raise SystemExit(1)
+
 # --------------------------------------------------
 # Derived TP/lot settings (built from config.py - see that file to change
 # any of the values used here)
@@ -85,8 +175,8 @@ BREAKEVEN_DISTANCE = TP_PIPS[0] * PIP_VALUE
 # again, or reset with a 'lot size auto' message.
 CURRENT_LOT_OVERRIDE = None
 
-INSTITUTIONAL_LOT_DEFAULT = config.INSTITUTIONAL_LOT_DEFAULT
-INSTITUTIONAL_LOT_OVERRIDE = INSTITUTIONAL_LOT_DEFAULT
+INSTITUTIONAL_RISK_PERCENT = config.INSTITUTIONAL_RISK_PERCENT
+INSTITUTIONAL_LOT_OVERRIDE = None
 
 INSTITUTIONAL_TP_PIPS = [p for p, _ in config.INSTITUTIONAL_TP_STRUCTURE]
 INSTITUTIONAL_TP_FRACTIONS = [f for _, f in config.INSTITUTIONAL_TP_STRUCTURE]
@@ -106,6 +196,63 @@ active_trades = {}
 # When True, the bot ignores new 'Buy/Sell Now' signals (both sources) but
 # keeps managing any trades already open - set via /pause and /resume.
 TRADING_PAUSED = False
+
+
+def save_active_trades():
+    """
+    Writes active_trades to config.TRADE_STATE_FILE so a crash or restart
+    doesn't 'forget' about positions that are still open in MT5. Called
+    right after a trade opens/closes and once per monitor cycle, so it
+    also captures TP-ladder and breakeven progress as it happens.
+    """
+
+    try:
+        with open(config.TRADE_STATE_FILE, 'w') as f:
+            json.dump({str(ticket): trade for ticket, trade in active_trades.items()}, f)
+    except Exception:
+        logger.exception('Failed to save trade state to %s', config.TRADE_STATE_FILE)
+
+
+def load_active_trades():
+    """
+    Restores active_trades from config.TRADE_STATE_FILE on startup. Each
+    saved ticket is checked against MT5's actual open positions first -
+    anything that closed while the bot was offline is logged and dropped
+    rather than recovered, since its TP/breakeven progress can no longer
+    be trusted and there's nothing left to manage.
+    """
+
+    global active_trades
+
+    if not os.path.exists(config.TRADE_STATE_FILE):
+        return
+
+    try:
+        with open(config.TRADE_STATE_FILE) as f:
+            raw = json.load(f)
+    except Exception:
+        logger.exception(
+            'Failed to read %s - starting with no recovered trades',
+            config.TRADE_STATE_FILE)
+        return
+
+    recovered = 0
+
+    for ticket_str, trade in raw.items():
+        ticket = int(ticket_str)
+
+        if mt5.positions_get(ticket=ticket):
+            active_trades[ticket] = trade
+            recovered += 1
+        else:
+            logger.info(
+                'Saved trade %s is no longer open in MT5 - not recovering '
+                '(closed while the bot was offline)', ticket)
+
+    if recovered:
+        logger.info('Recovered %d open trade(s) from %s', recovered, config.TRADE_STATE_FILE)
+
+    save_active_trades()  # drop the no-longer-open tickets from the file too
 
 # ==================================================
 # PATTERNS
@@ -185,7 +332,7 @@ HELP_TEXT = (
     '\n'
     'Trading control:\n'
     '/lot <size> - set a fixed lot size for future trades (this chat\'s source)\n'
-    '/lotauto - main channel only: reset to automatic risk-based sizing\n'
+    '/lotauto - reset to automatic risk-based sizing (this chat\'s source)\n'
     '/pause - stop opening new trades (existing trades still managed normally)\n'
     '/resume - resume opening new trades\n'
     '\n'
@@ -244,10 +391,10 @@ def clamp_lot(symbol, lot):
     return round(lot, 2)
 
 
-def calculate_lot_size(symbol, entry_price, sl_price, order_type):
+def calculate_lot_size(symbol, entry_price, sl_price, order_type, risk_percent=RISK_PERCENT):
     """
     Risk-based position sizing: sizes the trade so that if SL is hit,
-    the account loses approximately RISK_PERCENT of current balance.
+    the account loses approximately risk_percent of current balance.
     Falls back to the symbol's minimum lot if inputs are invalid, so a
     calculation failure can never silently produce a zero-lot order.
     """
@@ -258,7 +405,7 @@ def calculate_lot_size(symbol, entry_price, sl_price, order_type):
         logger.warning('Could not read account info - using minimum lot')
         return get_min_lot(symbol)
 
-    risk_amount = account.balance * (RISK_PERCENT / 100.0)
+    risk_amount = account.balance * (risk_percent / 100.0)
 
     # Loss (in account currency) for exactly 1.0 lot moving from entry to SL
     loss_per_lot = mt5.order_calc_profit(
@@ -273,7 +420,8 @@ def calculate_lot_size(symbol, entry_price, sl_price, order_type):
     return clamp_lot(symbol, raw_lot)
 
 
-def place_trade(symbol, signal, sl, tp, lot=None):
+def place_trade(symbol, signal, sl, tp, lot=None, risk_percent=RISK_PERCENT,
+                 magic=config.MAIN_MAGIC_NUMBER, comment=config.MAIN_ORDER_COMMENT):
 
     logger.info('PLACE TRADE CALLED - signal=%s sl=%s tp=%s', signal, sl, tp)
 
@@ -297,8 +445,8 @@ def place_trade(symbol, signal, sl, tp, lot=None):
     symbol_info = mt5.symbol_info(symbol)
 
     if lot is None:
-        lot = calculate_lot_size(symbol, price, sl, order_type)
-        logger.info('Lot size (auto, %s%% risk): %s', RISK_PERCENT, lot)
+        lot = calculate_lot_size(symbol, price, sl, order_type, risk_percent)
+        logger.info('Lot size (auto, %s%% risk): %s', risk_percent, lot)
     else:
         logger.info('Lot size (manual override): %s', lot)
 
@@ -311,8 +459,8 @@ def place_trade(symbol, signal, sl, tp, lot=None):
         'sl': round(sl, symbol_info.digits),
         'tp': round(tp, symbol_info.digits),
         'deviation': 20,
-        'magic': 123456,
-        'comment': 'Telegram Bot',
+        'magic': magic,
+        'comment': comment,
         'type_time': mt5.ORDER_TIME_GTC,
         'type_filling': mt5.ORDER_FILLING_IOC,
     }
@@ -429,13 +577,13 @@ def check_tp1_and_move_to_breakeven(ticket, trade):
     and marks it done so we don't keep re-sending the same modify request
     every monitor cycle.
 
-    Only applies to trades with auto_breakeven=True (main channel).
-    Institutional Trader trades skip this entirely - their SL only moves to
-    breakeven when the group explicitly says so (e.g. 'shifting my SL to BE
-    now'), handled by the manual 'sl to be' message check in the handler.
+    Each trade's 'auto_breakeven' flag is set when it's opened, based on
+    AUTO_BREAKEVEN_MAIN / INSTITUTIONAL_AUTO_BREAKEVEN in config.py. When
+    it's False for a source, breakeven only happens via /be or the
+    provider's own 'sl to be' message, handled elsewhere in the handler.
     """
 
-    if not trade.get('auto_breakeven', config.AUTO_BREAKEVEN_MAIN):
+    if not trade.get('auto_breakeven', False):
         return
 
     if trade.get('breakeven_done'):
@@ -661,8 +809,12 @@ def build_status_message():
         f'{CURRENT_LOT_OVERRIDE} (manual)' if CURRENT_LOT_OVERRIDE is not None
         else f'auto ({RISK_PERCENT}% risk)'
     )
+    institutional_lot = (
+        f'{INSTITUTIONAL_LOT_OVERRIDE} (manual)' if INSTITUTIONAL_LOT_OVERRIDE is not None
+        else f'auto ({INSTITUTIONAL_RISK_PERCENT}% risk)'
+    )
     lines.append(f'Main lot size: {main_lot}')
-    lines.append(f'Institutional lot size: {INSTITUTIONAL_LOT_OVERRIDE}')
+    lines.append(f'Institutional lot size: {institutional_lot}')
     lines.append('')
 
     lines.append(f'Active trades: {len(active_trades)}/{MAX_ACTIVE_TRADES}')
@@ -725,6 +877,9 @@ async def close_all_trades(source):
                 pnl = await asyncio.to_thread(get_closed_trade_pnl, ticket)
                 await send_trade_close_notification(ticket, closed_trade, pnl)
                 closed.append(ticket)
+
+    if closed:
+        save_active_trades()
 
     return closed
 
@@ -810,9 +965,9 @@ async def handler(event):
     if chat_id == INSTITUTE_UPDATE_CHAT_ID:
 
         if lot_auto_command_pattern.match(text):
-            INSTITUTIONAL_LOT_OVERRIDE = INSTITUTIONAL_LOT_DEFAULT
-            logger.info('Institutional lot size reset to default (%s)', INSTITUTIONAL_LOT_DEFAULT)
-            await event.reply(f'✅ Institutional lot size reset to default ({INSTITUTIONAL_LOT_DEFAULT})')
+            INSTITUTIONAL_LOT_OVERRIDE = None
+            logger.info('Institutional lot sizing reset to automatic risk-based calculation')
+            await event.reply('✅ Institutional lot sizing reset to automatic (risk-based) calculation')
             return
 
         lot_match = lot_command_pattern.match(text)
@@ -979,6 +1134,11 @@ async def handler(event):
                 return
 
             lot_for_trade = INSTITUTIONAL_LOT_OVERRIDE if institutional else CURRENT_LOT_OVERRIDE
+            risk_percent_for_trade = INSTITUTIONAL_RISK_PERCENT if institutional else RISK_PERCENT
+            magic_for_trade = config.INSTITUTIONAL_MAGIC_NUMBER if institutional else config.MAIN_MAGIC_NUMBER
+            comment_for_trade = config.INSTITUTIONAL_ORDER_COMMENT if institutional else config.MAIN_ORDER_COMMENT
+
+            await asyncio.to_thread(ensure_mt5_connected)
 
             trade_result = await asyncio.to_thread(
                 place_trade,
@@ -986,7 +1146,10 @@ async def handler(event):
                 trade_type,
                 sl,
                 broker_tp,
-                lot_for_trade
+                lot_for_trade,
+                risk_percent_for_trade,
+                magic_for_trade,
+                comment_for_trade
             )
 
             if trade_result:
@@ -1031,13 +1194,18 @@ async def handler(event):
                         'original_lot': actual_lot,
                         'lot': actual_lot,
                         'breakeven_done': False,
-                        # Main channel: auto BE at the fixed pip distance.
-                        # Institutional: BE only on an explicit 'sl to be'
-                        # message from the group (handled below).
-                        'auto_breakeven': not institutional,
+                        # Whether this trade auto-moves to breakeven at its
+                        # first TP level, per source (see config.py). When
+                        # False, breakeven only happens via /be or the
+                        # provider's own 'sl to be' message.
+                        'auto_breakeven': (
+                            config.INSTITUTIONAL_AUTO_BREAKEVEN if institutional
+                            else config.AUTO_BREAKEVEN_MAIN
+                        ),
                     }
 
                     logger.info('Trade stored: %s', active_trades[ticket])
+                    save_active_trades()
 
                     await send_trade_open_notification(ticket, active_trades[ticket])
 
@@ -1077,6 +1245,8 @@ async def monitor_trades():
 
     while True:
 
+        await asyncio.to_thread(ensure_mt5_connected)
+
         if active_trades:
             logger.debug('Checking %s active trade(s)...', len(active_trades))
 
@@ -1108,6 +1278,8 @@ async def monitor_trades():
                 active_trades[ticket]
             )
 
+        save_active_trades()
+
         await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
 
 # ==================================================
@@ -1116,6 +1288,8 @@ async def monitor_trades():
 
 
 async def main():
+
+    load_active_trades()
 
     logger.info('Bot started - waiting for Telegram messages...')
 

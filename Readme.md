@@ -49,46 +49,80 @@ When the bot sees that pair, it:
 3. Watches the trade and closes it in pieces as price moves in your
    favor, according to a fixed pip ladder (see below) — instead of
    waiting for one all-or-nothing TP.
-4. Moves the stop-loss to breakeven once the first ladder level is hit,
-   so a winning trade can no longer turn into a loss.
+4. Moves the stop-loss to breakeven once the first ladder level is hit
+   (if enabled for that source — see below), so a winning trade can no
+   longer turn into a loss.
 5. Sends you a Telegram message when a trade opens and when it closes,
    with the final profit/loss.
-
-It also understands a few plain-English admin messages sent in the same
-chats — `lot size 0.5`, `lot size auto`, `close all open positions`,
-`cancel` — so you can control it without touching the code.
+6. Understands a set of `/slash` commands you can send yourself to
+   control it directly (lot size, pause, status, and more — full list
+   below), and separately reacts automatically when the signal provider
+   posts their own cancel/close-all/breakeven messages.
 
 ### Two independent signal sources
 
 The bot can watch two separate places at once, each with its own lot
-sizing and its own take-profit ladder:
+sizing, breakeven behavior, and take-profit ladder:
 
 | | Main channel | "Institutional Trader" topic |
 |---|---|---|
-| Lot sizing | Risk-based (% of balance) or manual override | Always a fixed lot |
-| Breakeven | Automatic, at the first TP level | Manual only (an explicit "sl to be" message) |
+| Lot sizing | Auto risk-based (% of balance) by default, or `/lot X` for a fixed override | Same as main: auto risk-based by default, or `/lot X` (sent in the Institute update chat) for a fixed override |
+| Breakeven | Automatic by default, at the first TP level — toggle with `/breakeven main on\|off` | Manual by default — `/be`, the provider's "sl to be" message, or `/breakeven institutional on` to make it automatic too |
 | Notifications | Sent to `NOTIFY_CHANNEL` | Sent to `INSTITUTE_UPDATE_CHAT_ID` |
 
 You can disable the second source entirely by setting
 `GRIND_ROOM_CHAT_ID = None` in `config.py` if you only want the main
 channel.
 
-### The take-profit ladder
+### No split/scaled entries
 
-Instead of one TP, the bot closes a portion of the trade at each of five
-fixed pip distances from your entry price. By default (main channel):
+Every signal opens as **one single trade at full lot size**, the moment
+the range/SL/TP message arrives. The bot does not scale into a position
+in pieces as price moves through the signal's range — the range in the
+signal is informational only (see above). Partial *closes* happen via the
+TP ladder below, but the *entry* is always one trade, one lot amount.
+
+### The take-profit ladders
+
+Instead of one TP, the bot closes a portion of the trade at each of several
+fixed pip distances from your entry price. Each source has its own ladder.
+These are the values a fresh install starts with — see "Managing the bot
+from Telegram" below for changing them without touching the VPS.
+
+**Main channel** — 5 levels, 75% closed, ~25% runs to the broker TP:
 
 | Level | Distance | Closes | Notes |
 |---|---|---|---|
-| TP1 | 20 pips | 20% | Also moves SL to breakeven |
+| TP1 | 20 pips | 20% | Also moves SL to breakeven (if main auto-breakeven is on) |
 | TP2 | 40 pips | 15% | |
 | TP3 | 60 pips | 10% | |
 | TP4 | 80 pips | 10% | |
 | TP5 | 100 pips | 20% | Remaining ~25% runs to the signal's own TP |
 
-All of this — pip distances, percentages, lot sizing, symbol, channel
-IDs — is adjustable in `config.py`. See that file for a full explanation
-of every setting.
+**Institutional Trader** — 3 levels, 80% closed, ~20% runs to the broker TP:
+
+| Level | Distance | Closes | Notes |
+|---|---|---|---|
+| TP1 | 20 pips | 40% | Also moves SL to breakeven, only if institutional auto-breakeven is on |
+| TP2 | 50 pips | 20% | |
+| TP3 | 80 pips | 20% | Remaining ~20% runs to the signal's own TP |
+
+### Managing the bot from Telegram — no VPS access needed
+
+Once it's running, you don't need to SSH back in for most changes. TP
+ladders, risk %, max lot, max simultaneous trades, and breakeven mode are
+all changeable live from Telegram (`/tp`, `/risk`, `/maxlot`,
+`/maxtrades`, `/breakeven` — full list in "Commands you send yourself"
+below), and every change is saved to `runtime_settings.json` so it
+survives a restart. `config.py`'s values for these are just the starting
+defaults for a brand-new install.
+
+**What can't move to Telegram, and has to stay in `config.py` on the
+VPS:** the channel/topic IDs, your Telegram API credentials, `SYMBOL`,
+and `PIP_VALUE`. The bot subscribes to specific chats and connects to a
+specific broker symbol at startup, so changing any of these needs a
+restart with new config regardless of where you set them — there's no
+"live" version of them to expose.
 
 ---
 
@@ -305,15 +339,64 @@ journalctl -u callistofx -f          # watch its logs live
 sudo systemctl restart callistofx    # restart it
 ```
 
-Controlling it from Telegram (send these in the relevant chat):
+### Commands you send yourself
 
-| Message | Effect |
+`/status`, `/help`, `/pause`, `/resume`, `/settings`, `/maxlot`, and
+`/maxtrades` work from anywhere the bot is listening. Everything else
+applies to whichever source that chat belongs to (main channel/test
+channel → main; Institutional Trader topic or the Institute update chat →
+institutional) — unless you specify the source explicitly, which works
+from any chat.
+
+| Command | Effect |
 |---|---|
-| `lot size 0.5` | Sets a fixed lot size for future trades |
-| `lot size auto` | Goes back to risk-based sizing (main channel only) |
-| `close all open positions` | Fully closes every trade from that source |
-| `cancel` / `no longer looking` | Cancels a signal that was armed but not yet completed |
-| `sl to be` | Manually moves SL to breakeven for open trades from that source |
+| `/status` | Shows pause state, both sources' lot settings, and every open trade with live PnL |
+| `/help` | Lists all commands |
+| `/pause` | Stops new trades from opening (existing trades keep being managed normally) |
+| `/resume` | Resumes opening new trades |
+| `/lot <size>` | Sets a fixed lot size for that source (e.g. `/lot 0.5`) |
+| `/lotauto` | Resets that source back to automatic risk-based sizing |
+| `/closeall` | Closes every open trade from that source, with a confirmation reply |
+| `/cancel` | Cancels a signal that's armed but hasn't received its range/SL/TP message yet |
+| `/be` | Manually moves SL to breakeven for that source's open trades |
+
+**Settings — change these any time, no VPS or restart needed. Changes
+persist and only affect trades opened after the change:**
+
+| Command | Effect |
+|---|---|
+| `/settings` | Shows current risk %, max lot, max trades, both TP ladders, and breakeven mode |
+| `/tp [main\|institutional] <pips:fraction,...>` | Sets that source's TP ladder, e.g. `/tp main 20:0.2,40:0.15,60:0.1,80:0.1,100:0.2` |
+| `/risk [main\|institutional] <percent>` | Sets the risk % used when that source's lot sizing is on auto |
+| `/breakeven [main\|institutional] <on\|off>` | Toggles auto-breakeven for that source |
+| `/maxlot <size>` | Sets the hard lot cap (both sources) |
+| `/maxtrades <n>` | Sets the max number of simultaneous trades (both sources) |
+
+The `main`/`institutional` part of `/tp`, `/risk`, and `/breakeven` is
+optional — leave it out and it's inferred from which chat you send the
+command in, same as `/lot`.
+
+### Automatic reactions to the signal provider's own messages
+
+The bot also watches for these phrases *in the provider's own posts* and
+reacts without you doing anything — separate from the slash commands
+above, and these don't reply, since the provider isn't reading the bot's
+output:
+
+| Provider's phrase (examples) | Effect |
+|---|---|
+| "no longer looking", "cancel", "cancelled trade", "scrap that" | Cancels an armed signal, same as `/cancel` |
+| "close all open positions" (e.g. "POSITION CLOSED... CLOSE ALL OPEN POSITIONS NOW") | Closes that source's trades, same as `/closeall` |
+| "sl to be" (e.g. "take your partials set SL TO BE & Take partials NOW.") | Moves SL to breakeven, same as `/be` |
+
+**This is a narrower match than it might look.** The close-all trigger
+needs the exact phrase **"close all open positions"** — those four words,
+in that order. A message that just says "Position closed", "all
+positions closed", or even "close all positions" (missing the word
+"open") does **nothing** — the bot won't touch the trade. If the signal
+provider ever changes their exact wording for closing a trade, use
+`/closeall` yourself rather than relying on the automatic match, or open
+an issue/PR to add the new phrasing to `close_all_pattern` in `main.py`.
 
 ---
 
@@ -327,9 +410,10 @@ bridge server (step 10) isn't running, or the port doesn't match. Check
 the MT5 toolbar (see step 4) — it needs to be green.
 
 **Trades never open even though signals arrive** — check
-`MAX_ACTIVE_TRADES` in `config.py` hasn't been reached, and that your
-broker's symbol name matches `SYMBOL` exactly (many brokers suffix gold
-with `.s`, `.raw`, etc. — check Market Watch in MT5).
+`MAX_ACTIVE_TRADES` in `config.py` hasn't been reached, that the bot
+isn't paused (`/status` shows this), and that your broker's symbol name
+matches `SYMBOL` exactly (many brokers suffix gold with `.s`, `.raw`,
+etc. — check Market Watch in MT5).
 
 **Bridge connection refused** — make sure you started the bridge server
 (step 10/11) *before* the bot, and that MT5 itself is open under Wine.
@@ -337,3 +421,29 @@ with `.s`, `.raw`, etc. — check Market Watch in MT5).
 **Wine/MT5 randomly stops responding** — Wine running MT5 for weeks at a
 time can get flaky. A scheduled weekly restart of the whole stack (Xvfb →
 MT5 → bridge → bot) is common practice for this kind of setup.
+
+---
+
+## Reliability features
+
+A few things the bot does on its own to make unattended operation safer:
+
+- **Single-instance lock** — the bot won't start a second time if it's
+  already running (prevents accidentally double-trading every signal from
+  two copies). Uses `callistofx.lock` next to `main.py`.
+- **Trade state survives restarts** — open trades are saved to
+  `active_trades.json` as they change, and reloaded on startup. If the
+  bot crashes or systemd restarts it, it picks back up managing whatever
+  positions are still genuinely open in MT5, rather than "forgetting"
+  them. Anything that actually closed while the bot was offline is
+  logged and not recovered.
+- **MT5 reconnect attempts** — if the Wine/MT5 bridge connection drops,
+  the bot retries a few times (`MT5_RECONNECT_ATTEMPTS` /
+  `MT5_RECONNECT_DELAY_SECONDS` in `config.py`) before giving up and
+  exiting, so systemd can restart it cleanly rather than it running on in
+  a half-broken state.
+
+Both `active_trades.json`, `runtime_settings.json`, and `callistofx.lock`
+are runtime state, not settings — make sure your `.gitignore` includes
+them alongside `.env` and `trade_session.session`.
+

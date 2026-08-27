@@ -70,27 +70,32 @@ SYMBOL = 'XAUUSD.s'
 PIP_VALUE = 0.10
 
 # The bot will not open a new trade while this many are already active,
-# across both signal sources combined.
+# across both signal sources combined. STARTING VALUE ONLY - once the bot
+# has run, /maxtrades in Telegram is the source of truth; see
+# RUNTIME_SETTINGS_FILE above.
 MAX_ACTIVE_TRADES = 5
 
 # --- Main channel lot sizing (risk-based by default) ---
 
 # % of account balance risked per trade if no manual lot size is set. The
 # lot size is calculated so a stop-loss hit loses approximately this % of
-# balance. Change with a 'lot size X' message in the main channel, or
-# 'lot size auto' to go back to this risk-based calculation.
+# balance. STARTING VALUE ONLY - change it any time with '/risk main X' in
+# Telegram (persists across restarts); '/lot X' / '/lotauto' switch
+# between manual and automatic sizing without touching this %.
 RISK_PERCENT = 25.0
 
 # Hard cap on lot size, regardless of the risk calculation or any manual
 # override. This is your last line of defense against a mis-typed lot size
-# or an unexpectedly large risk calculation.
+# or an unexpectedly large risk calculation. STARTING VALUE ONLY - change
+# with '/maxlot X' in Telegram.
 MAX_LOT = 1.5
 
 # --- Institutional Trader (second source) lot sizing ---
-# This source always trades a fixed lot - there is no risk-based mode for
-# it. Change it with a 'lot size X' message sent in the Institute update
-# chat, or 'lot size auto' to reset to this default.
-INSTITUTIONAL_LOT_DEFAULT = 0.05
+# Same two modes as the main channel: automatic risk-based sizing (this %
+# of balance) by default, or a manual override set with '/lot X' sent in
+# the Institute update chat ('/lotauto' there resets back to automatic).
+# STARTING VALUE ONLY - change the % any time with '/risk institutional X'.
+INSTITUTIONAL_RISK_PERCENT = 25.0
 
 # ==================================================
 # TAKE-PROFIT LADDERS
@@ -98,8 +103,14 @@ INSTITUTIONAL_LOT_DEFAULT = 0.05
 # Each entry is (pips_from_entry, fraction_of_original_lot_to_close).
 # Fractions don't need to add up to 100% - whatever's left after the last
 # level keeps running until it hits the signal's own broker TP or the SL.
-# The first level in each ladder also triggers the automatic move-to-
-# breakeven (main channel only - see AUTO_BREAKEVEN_MAIN below).
+#
+# STARTING VALUES ONLY - both ladders below can be changed any time from
+# Telegram with '/tp main 20:0.2,40:0.15,...' or '/tp institutional ...'
+# (persists across restarts). Only trades opened after the change use the
+# new ladder; anything already open keeps the ladder it started with.
+# The first level in each ladder is also the trigger point for that
+# source's auto-breakeven, when auto-breakeven is enabled for it (see
+# AUTO_BREAKEVEN_MAIN / INSTITUTIONAL_AUTO_BREAKEVEN below).
 
 # Main channel: 75% closed across 5 levels, ~25% runs to the broker TP.
 MAIN_TP_STRUCTURE = [
@@ -111,8 +122,8 @@ MAIN_TP_STRUCTURE = [
 ]
 
 # Institutional Trader: percentages are of whatever the current
-# institutional lot override is, so they stay proportional if you change
-# it away from the 0.05 default.
+# institutional lot is (auto or manual), so they stay proportional
+# whichever mode you're in.
 INSTITUTIONAL_TP_STRUCTURE = [
     (20, 0.40),
     (50, 0.20),
@@ -120,10 +131,16 @@ INSTITUTIONAL_TP_STRUCTURE = [
 ]
 
 # If True, the main channel's SL auto-moves to breakeven once price
-# reaches the first TP level above. The Institutional Trader source never
-# auto-moves to breakeven - it only happens on an explicit 'sl to be'
-# message from that group.
+# reaches the first TP level above (20 pips by default). STARTING VALUE
+# ONLY - toggle any time with '/breakeven main on' or '/breakeven main off'.
 AUTO_BREAKEVEN_MAIN = True
+
+# If True, the Institutional Trader source ALSO auto-moves to breakeven
+# at its own first TP level (20 pips by default) - same mechanism as the
+# main channel. If False (the default), it only moves to breakeven when
+# you send /be, or the provider posts a message containing 'sl to be'.
+# STARTING VALUE ONLY - toggle with '/breakeven institutional on'/'off'.
+INSTITUTIONAL_AUTO_BREAKEVEN = False
 
 # ==================================================
 # MONITORING
@@ -132,3 +149,42 @@ AUTO_BREAKEVEN_MAIN = True
 # How often (in seconds) the bot checks open trades against their TP
 # levels and breakeven condition. Lower = more responsive, more MT5 calls.
 MONITOR_INTERVAL_SECONDS = 0.5
+
+# ==================================================
+# RELIABILITY
+# ==================================================
+
+# Where the bot saves its list of currently-open trades, so a crash or
+# restart doesn't "forget" about positions still open in MT5. Relative
+# paths are relative to wherever you run main.py from. This file is
+# runtime state, not settings - don't commit it (it's in .gitignore).
+TRADE_STATE_FILE = 'active_trades.json'
+
+# Where the bot saves any settings changed via Telegram (/tp, /risk,
+# /breakeven, /maxlot, /maxtrades) so they survive a restart without you
+# needing to edit this file or log into the VPS again. Overrides whatever
+# is set below for the settings it covers; if this file doesn't exist yet
+# (or a particular setting was never changed), the values below stand.
+# Runtime state, not settings - don't commit it (it's in .gitignore).
+RUNTIME_SETTINGS_FILE = 'runtime_settings.json'
+
+# Prevents two copies of the bot running at once (e.g. forgetting one's
+# already running in another terminal), which would double-trade every
+# signal. The lock is held for as long as the process is alive and
+# released automatically when it exits, cleanly or not.
+LOCK_FILE = 'callistofx.lock'
+
+# If an MT5 call fails (bridge dropped, Wine crashed, etc.), the bot
+# tries to reconnect this many times, waiting this many seconds between
+# attempts, before giving up and shutting down (systemd will then restart
+# it after RestartSec, per callistofx.service).
+MT5_RECONNECT_ATTEMPTS = 5
+MT5_RECONNECT_DELAY_SECONDS = 10
+
+# Magic numbers tag every order so you (or another EA on the same
+# account) can tell at a glance in MT5's history which trades came from
+# which source. Comments show up next to the trade in the MT5 terminal.
+MAIN_MAGIC_NUMBER = 123456
+INSTITUTIONAL_MAGIC_NUMBER = 123457
+MAIN_ORDER_COMMENT = 'CallistoFx Main'
+INSTITUTIONAL_ORDER_COMMENT = 'CallistoFx Institutional'
