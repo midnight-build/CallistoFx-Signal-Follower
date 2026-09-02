@@ -1,0 +1,34 @@
+# The mt5linux bridge server - connects the bot's Linux Python to MT5
+# via the Wine Python installed in step 7 of the README. Waits 20 seconds
+# after MT5 starts before launching, to give MT5 time to actually finish
+# loading and reconnect to your broker before anything tries to talk to it.
+#
+# IMPORTANT: rpyc must be pinned to ==5.0.1 on BOTH the Linux side and
+# inside Wine's Python for this to work - see README step 8 and the
+# Troubleshooting section if this service's logs show a
+# 'ValueError: not enough values to unpack' / brine.load error.
+#
+# INSTALL:
+#   sudo cp mt5-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable mt5-bridge
+#   sudo systemctl start mt5-bridge
+
+[Unit]
+Description=mt5linux bridge server
+After=mt5-terminal.service
+Requires=mt5-terminal.service
+
+[Service]
+Type=simple
+User=ubuntu
+Environment="DISPLAY=:1"
+Environment="WINEPREFIX=/home/ubuntu/.wine"
+WorkingDirectory=/home/ubuntu/callstoFx
+ExecStartPre=/bin/sleep 20
+ExecStart=/usr/bin/python3 -m mt5linux --host localhost --port 8001 "/home/ubuntu/.wine/drive_c/users/ubuntu/AppData/Local/Programs/Python/Python313/python.exe"
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

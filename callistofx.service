@@ -1,0 +1,32 @@
+# Systemd service for CallistoFx (Telegram -> MT5 signal bot).
+#
+# This keeps the bot running in the background, restarts it automatically
+# if it crashes, and starts it automatically on VPS reboot - waiting for
+# the mt5-bridge service (and everything that depends on) to be ready
+# first.
+#
+# INSTALL:
+#   sudo cp callistofx.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable callistofx
+#   sudo systemctl start callistofx
+#   sudo systemctl status callistofx      # check it's running
+#   journalctl -u callistofx -f           # watch its logs live
+
+[Unit]
+Description=CallistoFx Telegram to MT5 signal bot
+After=mt5-bridge.service network-online.target
+Requires=mt5-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/callstoFx
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/python3 /home/ubuntu/callstoFx/main.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

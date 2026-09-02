@@ -1,0 +1,23 @@
+# Virtual display for MT5 to draw into - the first thing in the startup
+# chain. Everything else (MT5 itself, and indirectly the bridge server)
+# depends on this being up first.
+#
+# INSTALL:
+#   sudo cp mt5-display.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable mt5-display
+#   sudo systemctl start mt5-display
+
+[Unit]
+Description=Virtual display (Xvfb) for MT5
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/Xvfb :1 -screen 0 1280x800x16
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

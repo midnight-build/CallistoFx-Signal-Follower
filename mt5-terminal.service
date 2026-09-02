@@ -1,0 +1,32 @@
+# MetaTrader 5, running under Wine, drawing to the virtual display from
+# mt5-display.service. Waits 5 seconds after that display comes up before
+# launching, to give Xvfb a moment to actually be ready to accept
+# connections.
+#
+# This assumes you already logged in once by hand (over VNC) and ticked
+# "Save account information" - MT5 will auto-reconnect using that saved
+# session on every restart, with no further input needed.
+#
+# INSTALL:
+#   sudo cp mt5-terminal.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable mt5-terminal
+#   sudo systemctl start mt5-terminal
+
+[Unit]
+Description=MetaTrader 5 (under Wine)
+After=mt5-display.service
+Requires=mt5-display.service
+
+[Service]
+Type=simple
+User=ubuntu
+Environment="DISPLAY=:1"
+Environment="WINEPREFIX=/home/ubuntu/.wine"
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/wine "/home/ubuntu/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

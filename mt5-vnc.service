@@ -1,0 +1,33 @@
+# Optional: keeps x11vnc running permanently so you can look at the MT5
+# desktop (via SSH tunnel + a VNC viewer, same as during setup) whenever
+# you want, without manually re-running the x11vnc command each time.
+#
+# Not required for the bot to function - main.py never touches this.
+# Only useful for checking in on MT5 visually later (e.g. if it ever logs
+# out and needs a manual re-login).
+#
+# INSTALL:
+#   sudo cp mt5-vnc.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable mt5-vnc
+#   sudo systemctl start mt5-vnc
+#
+# TO VIEW: from your own computer,
+#   ssh -i /path/to/key -L 5900:localhost:5900 ubuntu@YOUR_VPS_IP
+# then connect a VNC viewer to localhost::5900 (two colons).
+
+[Unit]
+Description=x11vnc for MT5's virtual display
+After=mt5-display.service
+Requires=mt5-display.service
+
+[Service]
+Type=simple
+User=ubuntu
+Environment="DISPLAY=:1"
+ExecStart=/usr/bin/x11vnc -display :1 -nopw -listen localhost -xkb -forever
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
